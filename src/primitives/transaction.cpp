@@ -72,23 +72,50 @@ JSDescription JSDescription::Randomized(
     );
 }
 
+class SproutProofVerifier : public boost::static_visitor<bool>
+{
+    ZCJoinSplit& params;
+    libzcash::ProofVerifier& verifier;
+    const uint256& pubKeyHash;
+    const JSDescription& jsdesc;
+
+public:
+    SproutProofVerifier(
+        ZCJoinSplit& params,
+        libzcash::ProofVerifier& verifier,
+        const uint256& pubKeyHash,
+        const JSDescription& jsdesc
+        ) : params(params), jsdesc(jsdesc), verifier(verifier), pubKeyHash(pubKeyHash) {}
+
+    bool operator()(const libzcash::ZCProof& proof) const
+    {
+        return params.verify(
+            proof,
+            verifier,
+            pubKeyHash,
+            jsdesc.randomSeed,
+            jsdesc.macs,
+            jsdesc.nullifiers,
+            jsdesc.commitments,
+            jsdesc.vpub_old,
+            jsdesc.vpub_new,
+            jsdesc.anchor
+        );
+    }
+
+    bool operator()(const libzcash::GrothProof& proof) const
+    {
+        return false;
+    }
+};
+
 bool JSDescription::Verify(
     ZCJoinSplit& params,
     libzcash::ProofVerifier& verifier,
     const uint256& pubKeyHash
 ) const {
-    return params.verify(
-        proof,
-        verifier,
-        pubKeyHash,
-        randomSeed,
-        macs,
-        nullifiers,
-        commitments,
-        vpub_old,
-        vpub_new,
-        anchor
-    );
+    auto pv = SproutProofVerifier(params, verifier, pubKeyHash, *this);
+    boost::apply_visitor(pv, proof);
 }
 
 uint256 JSDescription::h_sig(ZCJoinSplit& params, const uint256& pubKeyHash) const
@@ -146,9 +173,10 @@ std::string CTxOut::ToString() const
     return strprintf("CTxOut(nValue=%d.%08d, scriptPubKey=%s)", nValue / COIN, nValue % COIN, scriptPubKey.ToString().substr(0,30));
 }
 
-CMutableTransaction::CMutableTransaction() : nVersion(CTransaction::SPROUT_MIN_CURRENT_VERSION), fOverwintered(false), nVersionGroupId(0), nExpiryHeight(0), nLockTime(0) {}
+CMutableTransaction::CMutableTransaction() : nVersion(CTransaction::SPROUT_MIN_CURRENT_VERSION), fOverwintered(false), nVersionGroupId(0), nExpiryHeight(0), nLockTime(0), valueBalance(0) {}
 CMutableTransaction::CMutableTransaction(const CTransaction& tx) : nVersion(tx.nVersion), fOverwintered(tx.fOverwintered), nVersionGroupId(tx.nVersionGroupId), nExpiryHeight(tx.nExpiryHeight),
                                                                    vin(tx.vin), vout(tx.vout), nLockTime(tx.nLockTime),
+                                                                   valueBalance(tx.valueBalance), vShieldedSpend(tx.vShieldedSpend), vShieldedOutput(tx.vShieldedOutput),
                                                                    vjoinsplit(tx.vjoinsplit), joinSplitPubKey(tx.joinSplitPubKey), joinSplitSig(tx.joinSplitSig)
 {
     
@@ -164,10 +192,11 @@ void CTransaction::UpdateHash() const
     *const_cast<uint256*>(&hash) = SerializeHash(*this);
 }
 
-CTransaction::CTransaction() : nVersion(CTransaction::SPROUT_MIN_CURRENT_VERSION), fOverwintered(false), nVersionGroupId(0), nExpiryHeight(0), vin(), vout(), nLockTime(0), vjoinsplit(), joinSplitPubKey(), joinSplitSig() { }
+CTransaction::CTransaction() : nVersion(CTransaction::SPROUT_MIN_CURRENT_VERSION), fOverwintered(false), nVersionGroupId(0), nExpiryHeight(0), vin(), vout(), nLockTime(0), valueBalance(0), vShieldedSpend(), vShieldedOutput(), vjoinsplit(), joinSplitPubKey(), joinSplitSig() { }
 
 CTransaction::CTransaction(const CMutableTransaction &tx) : nVersion(tx.nVersion), fOverwintered(tx.fOverwintered), nVersionGroupId(tx.nVersionGroupId), nExpiryHeight(tx.nExpiryHeight),
                                                             vin(tx.vin), vout(tx.vout), nLockTime(tx.nLockTime),
+                                                            valueBalance(tx.valueBalance), vShieldedSpend(tx.vShieldedSpend), vShieldedOutput(tx.vShieldedOutput),
                                                             vjoinsplit(tx.vjoinsplit), joinSplitPubKey(tx.joinSplitPubKey), joinSplitSig(tx.joinSplitSig)
 {
     UpdateHash();
@@ -179,6 +208,7 @@ CTransaction::CTransaction(
     const CMutableTransaction &tx,
     bool evilDeveloperFlag) : nVersion(tx.nVersion), fOverwintered(tx.fOverwintered), nVersionGroupId(tx.nVersionGroupId), nExpiryHeight(tx.nExpiryHeight),
                               vin(tx.vin), vout(tx.vout), nLockTime(tx.nLockTime),
+                              valueBalance(tx.valueBalance), vShieldedSpend(tx.vShieldedSpend), vShieldedOutput(tx.vShieldedOutput),
                               vjoinsplit(tx.vjoinsplit), joinSplitPubKey(tx.joinSplitPubKey), joinSplitSig(tx.joinSplitSig)
 {
     assert(evilDeveloperFlag);
@@ -192,6 +222,9 @@ CTransaction& CTransaction::operator=(const CTransaction &tx) {
     *const_cast<std::vector<CTxOut>*>(&vout) = tx.vout;
     *const_cast<unsigned int*>(&nLockTime) = tx.nLockTime;
     *const_cast<uint32_t*>(&nExpiryHeight) = tx.nExpiryHeight;
+    *const_cast<CAmount*>(&valueBalance) = tx.valueBalance;
+    *const_cast<std::vector<SpendDescription>*>(&vShieldedSpend) = tx.vShieldedSpend;
+    *const_cast<std::vector<OutputDescription>*>(&vShieldedOutput) = tx.vShieldedOutput;
     *const_cast<std::vector<JSDescription>*>(&vjoinsplit) = tx.vjoinsplit;
     *const_cast<uint256*>(&joinSplitPubKey) = tx.joinSplitPubKey;
     *const_cast<joinsplit_sig_t*>(&joinSplitSig) = tx.joinSplitSig;
