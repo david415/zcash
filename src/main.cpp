@@ -866,8 +866,9 @@ unsigned int GetP2SHSigOpCount(const CTransaction& tx, const CCoinsViewCache& in
  */
 bool ContextualCheckTransaction(const CTransaction& tx, CValidationState &state, const int nHeight, const int dosLevel)
 {
-    bool isOverwinter = NetworkUpgradeActive(nHeight, Params().GetConsensus(), Consensus::UPGRADE_OVERWINTER);
-    bool isSprout = !isOverwinter;
+    bool overwinterActive = NetworkUpgradeActive(nHeight, Params().GetConsensus(), Consensus::UPGRADE_OVERWINTER);
+    bool saplingActive = NetworkUpgradeActive(nHeight, Params().GetConsensus(), Consensus::UPGRADE_SAPLING);
+    bool isSprout = !overwinterActive;
 
     // If Sprout rules apply, reject transactions which are intended for Overwinter and beyond
     if (isSprout && tx.fOverwintered) {
@@ -875,18 +876,39 @@ bool ContextualCheckTransaction(const CTransaction& tx, CValidationState &state,
                          REJECT_INVALID, "tx-overwinter-not-active");
     }
 
-    // If Overwinter rules apply:
-    if (isOverwinter) {
-        // Reject transactions with valid version but missing overwinter flag
-        if (tx.nVersion >= OVERWINTER_MIN_TX_VERSION && !tx.fOverwintered) {
-            return state.DoS(dosLevel, error("ContextualCheckTransaction(): overwinter flag must be set"),
-                            REJECT_INVALID, "tx-overwinter-flag-not-set");
-        }
+    // If Overwinter or Sapling rules apply:
+    if (overwinterActive) {
+        if (saplingActive) {
+            bool isSaplingV4 =
+                tx.fOverwintered &&
+                tx.nVersionGroupId == SAPLING_VERSION_GROUP_ID &&
+                tx.nVersion == SAPLING_TX_VERSION;
+            // Reject transactions with invalid version
+            if (!isSaplingV4) {
+                return state.DoS(dosLevel, error("CheckTransaction(): invalid Sapling tx version"),
+                        REJECT_INVALID, "bad-sapling-tx-version");
+            }
+        } else {
+            // Reject transactions with valid version but missing overwinter flag
+            if (tx.nVersion >= OVERWINTER_MIN_TX_VERSION && !tx.fOverwintered) {
+                return state.DoS(dosLevel, error("ContextualCheckTransaction(): overwinter flag must be set"),
+                                REJECT_INVALID, "tx-overwinter-flag-not-set");
+            }
 
-        // Reject transactions with invalid version
-        if (tx.fOverwintered && tx.nVersion > OVERWINTER_MAX_TX_VERSION ) {
-            return state.DoS(100, error("CheckTransaction(): overwinter version too high"),
-                REJECT_INVALID, "bad-tx-overwinter-version-too-high");
+            // Reject transactions with invalid version
+            if (tx.fOverwintered && tx.nVersion > OVERWINTER_MAX_TX_VERSION ) {
+                return state.DoS(100, error("CheckTransaction(): overwinter version too high"),
+                    REJECT_INVALID, "bad-tx-overwinter-version-too-high");
+            }
+            bool isOverwinterV3 =
+                tx.fOverwintered &&
+                tx.nVersionGroupId == OVERWINTER_VERSION_GROUP_ID &&
+                tx.nVersion == 3;
+            // Reject transactions with invalid version
+            if (!isOverwinterV3) {
+                return state.DoS(dosLevel, error("CheckTransaction(): invalid Overwinter tx version"),
+                        REJECT_INVALID, "bad-overwinter-tx-version");
+            }
         }
 
         // Reject transactions intended for Sprout
@@ -988,7 +1010,8 @@ bool CheckTransactionWithoutProofVerification(const CTransaction& tx, CValidatio
             return state.DoS(100, error("CheckTransaction(): overwinter version too low"),
                 REJECT_INVALID, "bad-tx-overwinter-version-too-low");
         }
-        if (tx.nVersionGroupId != OVERWINTER_VERSION_GROUP_ID) {
+        if (tx.nVersionGroupId != OVERWINTER_VERSION_GROUP_ID &&
+                tx.nVersionGroupId != SAPLING_VERSION_GROUP_ID) {
             return state.DoS(100, error("CheckTransaction(): unknown tx version group id"),
                     REJECT_INVALID, "bad-tx-version-group-id");
         }
