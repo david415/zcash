@@ -14,11 +14,70 @@
 #include "consensus/consensus.h"
 
 #include <boost/array.hpp>
+#include <boost/variant.hpp>
 
 #include "zcash/NoteEncryption.hpp"
 #include "zcash/Zcash.h"
 #include "zcash/JoinSplit.hpp"
 #include "zcash/Proof.hpp"
+
+namespace libzcash {
+    typedef base_blob<1536> GrothProof;
+}
+typedef base_blob<3072> SpendDescription;
+typedef base_blob<7584> OutputDescription;
+
+template <typename Stream>
+class SproutProofSerializer : public boost::static_visitor<>
+{
+    Stream& s;
+    int nType;
+    int nVersion;
+    bool useGroth;
+
+public:
+    SproutProofSerializer(Stream& s, int nType, int nVersion, bool useGroth) :
+        s(s), nType(nType), nVersion(nVersion), useGroth(useGroth) {}
+
+    void operator()(const libzcash::ZCProof& proof) const
+    {
+        if (useGroth) {
+            throw std::ios_base::failure("Invalid Sprout proof for transaction format");
+        }
+        ::Serialize(s, proof, nType, nVersion);
+    }
+
+    void operator()(const libzcash::GrothProof& proof) const
+    {
+        if (!useGroth) {
+            throw std::ios_base::failure("Invalid Sprout proof for transaction format");
+        }
+        ::Serialize(s, proof, nType, nVersion);
+    }
+};
+
+#define READWRITESPROUTPROOF(proof)      (::SerReadWriteSproutProof(s, (proof), nType, nVersion, useGroth, ser_action))
+
+template<typename Stream, typename T>
+inline void SerReadWriteSproutProof(Stream& s, const T& proof, int nType, int nVersion, bool useGroth, CSerActionSerialize ser_action)
+{
+    auto ps = SproutProofSerializer<Stream>(s, nType, nVersion, useGroth);
+    boost::apply_visitor(ps, proof);
+}
+
+template<typename Stream, typename T>
+inline void SerReadWriteSproutProof(Stream& s, T& proof, int nType, int nVersion, bool useGroth, CSerActionUnserialize ser_action)
+{
+    if (useGroth) {
+        libzcash::GrothProof grothProof;
+        ::Unserialize(s, grothProof, nType, nVersion);
+        proof = grothProof;
+    } else {
+        libzcash::ZCProof pghrProof;
+        ::Unserialize(s, pghrProof, nType, nVersion);
+        proof = pghrProof;
+    }
+}
 
 class JSDescription
 {
@@ -66,7 +125,7 @@ public:
 
     // JoinSplit proof
     // This is a zk-SNARK which ensures that this JoinSplit is valid.
-    libzcash::ZCProof proof;
+    boost::variant<libzcash::ZCProof, libzcash::GrothProof> proof;
 
     JSDescription(): vpub_old(0), vpub_new(0) { }
 
@@ -110,6 +169,12 @@ public:
 
     template <typename Stream, typename Operation>
     inline void SerializationOp(Stream& s, Operation ser_action, int nType, int nVersion) {
+        // nVersion is set by CTransaction and CMutableTransaction to
+        // (tx.fOverwintered << 31) | tx.nVersion
+        bool fOverwintered = nVersion >> 31;
+        int32_t txVersion = nVersion & 0x7FFFFFFF;
+        bool useGroth = fOverwintered && nVersion >= SAPLING_TX_VERSION;
+
         READWRITE(vpub_old);
         READWRITE(vpub_new);
         READWRITE(anchor);
@@ -118,7 +183,7 @@ public:
         READWRITE(ephemeralKey);
         READWRITE(randomSeed);
         READWRITE(macs);
-        READWRITE(proof);
+        READWRITESPROUTPROOF(proof);
         READWRITE(ciphertexts);
     }
 
@@ -361,6 +426,9 @@ public:
     const std::vector<CTxOut> vout;
     const uint32_t nLockTime;
     const uint32_t nExpiryHeight;
+    const CAmount valueBalance;
+    const std::vector<SpendDescription> vShieldedSpend;
+    const std::vector<OutputDescription> vShieldedOutput;
     const std::vector<JSDescription> vjoinsplit;
     const uint256 joinSplitPubKey;
     const joinsplit_sig_t joinSplitSig = {{0}};
@@ -389,23 +457,33 @@ public:
         }
         nVersion = this->nVersion;
         if (fOverwintered) {
+            nVersion |= 1 << 31;
             READWRITE(*const_cast<uint32_t*>(&this->nVersionGroupId));
         }
 
         bool isOverwinterV3 = fOverwintered &&
                               nVersionGroupId == OVERWINTER_VERSION_GROUP_ID &&
-                              nVersion == 3;
-        if (fOverwintered && !isOverwinterV3) {
+                              this->nVersion == 3;
+        bool isSaplingV4 =
+            fOverwintered &&
+            nVersionGroupId == SAPLING_VERSION_GROUP_ID &&
+            this->nVersion == SAPLING_TX_VERSION;
+        if (fOverwintered && !(isOverwinterV3 || isSaplingV4)) {
             throw std::ios_base::failure("Unknown transaction format");
         }
 
         READWRITE(*const_cast<std::vector<CTxIn>*>(&vin));
         READWRITE(*const_cast<std::vector<CTxOut>*>(&vout));
         READWRITE(*const_cast<uint32_t*>(&nLockTime));
-        if (isOverwinterV3) {
+        if (isOverwinterV3 || isSaplingV4) {
             READWRITE(*const_cast<uint32_t*>(&nExpiryHeight));
         }
-        if (nVersion >= 2) {
+        if (isSaplingV4) {
+            READWRITE(*const_cast<CAmount*>(&valueBalance));
+            READWRITE(*const_cast<std::vector<SpendDescription>*>(&vShieldedSpend));
+            READWRITE(*const_cast<std::vector<OutputDescription>*>(&vShieldedOutput));
+        }
+        if (this->nVersion >= 2) {
             READWRITE(*const_cast<std::vector<JSDescription>*>(&vjoinsplit));
             if (vjoinsplit.size() > 0) {
                 READWRITE(*const_cast<uint256*>(&joinSplitPubKey));
@@ -476,6 +554,9 @@ struct CMutableTransaction
     std::vector<CTxOut> vout;
     uint32_t nLockTime;
     uint32_t nExpiryHeight;
+    CAmount valueBalance;
+    std::vector<SpendDescription> vShieldedSpend;
+    std::vector<OutputDescription> vShieldedOutput;
     std::vector<JSDescription> vjoinsplit;
     uint256 joinSplitPubKey;
     CTransaction::joinsplit_sig_t joinSplitSig = {{0}};
@@ -504,23 +585,33 @@ struct CMutableTransaction
         }
         nVersion = this->nVersion;
         if (fOverwintered) {
+            nVersion |= 1 << 31;
             READWRITE(nVersionGroupId);
         }
 
         bool isOverwinterV3 = fOverwintered &&
                               nVersionGroupId == OVERWINTER_VERSION_GROUP_ID &&
-                              nVersion == 3;
-        if (fOverwintered && !isOverwinterV3) {
+                              this->nVersion == 3;
+        bool isSaplingV4 =
+            fOverwintered &&
+            nVersionGroupId == SAPLING_VERSION_GROUP_ID &&
+            this->nVersion == SAPLING_TX_VERSION;
+        if (fOverwintered && !(isOverwinterV3 || isSaplingV4)) {
             throw std::ios_base::failure("Unknown transaction format");
         }
 
         READWRITE(vin);
         READWRITE(vout);
         READWRITE(nLockTime);
-        if (isOverwinterV3) {
+        if (isOverwinterV3 || isSaplingV4) {
             READWRITE(nExpiryHeight);
         }
-        if (nVersion >= 2) {
+        if (isSaplingV4) {
+            READWRITE(valueBalance);
+            READWRITE(vShieldedSpend);
+            READWRITE(vShieldedOutput);
+        }
+        if (this->nVersion >= 2) {
             READWRITE(vjoinsplit);
             if (vjoinsplit.size() > 0) {
                 READWRITE(joinSplitPubKey);
